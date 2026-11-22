@@ -16,7 +16,13 @@ Return exactly one safe output: add_comment with only type and body, or noop
 if useful review is impossible. Do not set routing fields. Begin the comment
 with `VERDICT: CHANGES` only for a blocker, otherwise `VERDICT: APPROVE`.
 Tag every finding blocker, important or nit, with file and line. A blocker
-means a concrete security hole, data loss or failure of the main purpose.
-Report every finding in one pass, most serious first. In an approving review,
-put important findings and nits under Follow-ups. Include the admitted SHA;
-do not include a Verification paragraph.
+is a concrete defect within the change's scope with a stated failure: a
+security hole, data loss or failure of the main purpose, with the input or
+state that triggers it. Style, naming, speculative risk and work outside the
+change's scope are never blockers. Apply the same blocker criteria to the
+entire admitted diff on every review, even if an earlier review missed a defect.
+Group findings by root cause without raising their severity. For a shared
+blocker, name the architectural fix rather than listing symptoms. Report every
+finding in one pass, most serious first. In an approving review, list important
+findings and nits under Follow-ups. Include the admitted SHA; do not include a
+Verification paragraph.
