@@ -197,7 +197,11 @@ CI uses the shared workflow lint and read-only review policy. The review
 workflow loads `workflow/review.toml`, `workflow/review-command.toml` and
 `workflow/review.md` from the base branch, never privileged PR code. Real review
 submission stays off unless maintainers set `AGENT_REAL_REVIEWS=true` and
-configure the shared wrapper's repository variables. Configure branch rules
+configure the shared wrapper's repository variables. A review mints a one-hour
+tailnet key before it waits for a runner or an earlier review of the same pull
+request; if it fails after a long queue, let the queue clear and
+re-run all jobs, or comment `/review` again, since re-running only the failed
+job reuses the expired key. Configure branch rules
 to require CI and review approval with stale approvals dismissed; workflow
 files alone cannot enable that gate. Setting up the new privileged trigger
 may require an owner to bypass the ruleset.
