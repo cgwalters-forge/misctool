@@ -144,6 +144,15 @@ Incomplete searches or more than 1,000 results per repository fail; narrow the
 date range rather than silently lose candidates. List endpoints stop at 100
 pages of 100; failures do not produce partial output. No automatic retries.
 
+For a held-out sample, `--merged-since` (inclusive) and `--merged-before`
+(exclusive) restrict candidates to PRs whose search-result `merged_at` falls in
+that UTC window; unmerged PRs are then dropped before any reviews are read.
+Both filters apply: a PR merged in the window still needs a review on or after
+`--since`, and that review may precede the merge.
+`--max-pages N --page-size M` (default 10 of 100, at most 1,000 results) bounds
+each repository's search; a search with more results than the bound fails
+rather than returning a truncated list.
+
 Build uses the commit named by the earliest submitted review. The required
 `--base` is a full SHA from the caller's frozen historical record. Do not use
 today's PR base: it may already contain reviewed changes and silently shrink the
