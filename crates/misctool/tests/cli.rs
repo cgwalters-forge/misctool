@@ -64,6 +64,14 @@ fn architecture_review_cli_with_offline_gh() {
         "2025-03-01",
         "--exclude",
         "O/R#2",
+        "--merged-since",
+        "2025-02-01",
+        "--merged-before",
+        "2025-02-02",
+        "--max-pages",
+        "5",
+        "--page-size",
+        "20",
         "--out",
         "candidates.json",
     ]);
@@ -72,6 +80,13 @@ fn architecture_review_cli_with_offline_gh() {
         serde_json::from_slice(&std::fs::read(temp.path().join("candidates.json")).unwrap())
             .unwrap();
     assert_eq!(candidates.as_array().unwrap().len(), 1);
+    let calls = std::fs::read_to_string(temp.path().join("calls")).unwrap();
+    for wanted in [
+        "%20merged%3A2025-02-01T00%3A00%3A00Z..2025-02-01T23%3A59%3A59Z&",
+        "&per_page=20&page=1\n",
+    ] {
+        assert!(calls.contains(wanted), "{wanted} not in {calls}");
+    }
     let output = invoke(&[
         "packet",
         "build",

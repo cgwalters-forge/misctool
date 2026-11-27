@@ -18,6 +18,7 @@ const SCHEMA: &str = "architecture-review.packet.v1";
 const HELP: &str = "Build and verify feedback-isolated architecture review inputs.
 
 Usage: cgwalters-forge-misctool architecture-review discover --login LOGIN --repos OWNER/REPO,... --since YYYY-MM-DD --out FILE [--exclude OWNER/REPO#N,...]
+           [--merged-since YYYY-MM-DD] [--merged-before YYYY-MM-DD] [--max-pages N] [--page-size M]
        cgwalters-forge-misctool architecture-review packet build --pr OWNER/REPO#N --login LOGIN --base SHA --out DIRECTORY --manifest FILE [--max-files N] [--max-bytes N]
        cgwalters-forge-misctool architecture-review packet verify --dir DIRECTORY --manifest FILE
        cgwalters-forge-misctool architecture-review frozen verify --revision REV --manifest FILE [--repo DIRECTORY]
@@ -25,7 +26,9 @@ Usage: cgwalters-forge-misctool architecture-review discover --login LOGIN --rep
 GitHub reads use authenticated gh api GET against github.com only. No inference,
 posting, release publication or background work. Discovery includes other people's
 PRs with a submitted review on or after the UTC date; JSON output is controller-only.
-Searches over 1,000 results, incomplete searches and lists beyond 100 pages fail.
+The optional merged-at window is UTC, start inclusive and end exclusive. Searches
+over N pages of M results (default 10 of 100, at most 1,000), incomplete searches
+and lists beyond 100 pages fail.
 Build anchors to the login's earliest submitted review, not today's PR head.
 --base must come from the caller's historical record, not today's PR metadata.
 The complete annotated diff must fit (defaults: 30 files, 100000 bytes); optional
@@ -178,6 +181,90 @@ fn first_review(rows: &[Value], login: &str) -> Result<Option<(DateTime<Utc>, St
     Ok(found.into_iter().next())
 }
 
+// GitHub search returns at most 1,000 results per query.
+const SEARCH_CAP: usize = 1000;
+
+/// Optional merged-at window and search page bound for `discover`.
+struct Scope {
+    merged_since: Option<NaiveDate>,
+    merged_before: Option<NaiveDate>,
+    max_pages: usize,
+    page_size: usize,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            merged_since: None,
+            merged_before: None,
+            max_pages: SEARCH_CAP / PAGE_SIZE,
+            page_size: PAGE_SIZE,
+        }
+    }
+}
+
+fn midnight(date: NaiveDate) -> DateTime<Utc> {
+    date.and_time(chrono::NaiveTime::MIN).and_utc()
+}
+
+impl Scope {
+    fn validate(&self) -> Result<()> {
+        if !(1..=PAGE_SIZE).contains(&self.page_size)
+            || self.max_pages == 0
+            || self.max_pages.saturating_mul(self.page_size) > SEARCH_CAP
+        {
+            return Err(format!(
+                "--page-size must be 1-{PAGE_SIZE} and --max-pages positive, at most {SEARCH_CAP} results"
+            ));
+        }
+        if self
+            .merged_since
+            .zip(self.merged_before)
+            .is_some_and(|(start, end)| start >= end)
+        {
+            return Err("--merged-since must be before --merged-before".into());
+        }
+        Ok(())
+    }
+
+    // GitHub search does not intersect two qualifiers of the same name, so a
+    // paired window must be one inclusive range ending a second before the end.
+    fn qualifiers(&self) -> String {
+        const FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
+        let start = self.merged_since.map(|d| midnight(d).format(FORMAT));
+        match (start, self.merged_before.map(midnight)) {
+            (Some(start), Some(end)) => {
+                let last = end - chrono::TimeDelta::seconds(1);
+                format!(" merged:{start}..{}", last.format(FORMAT))
+            }
+            (Some(start), None) => format!(" merged:>={start}"),
+            (None, Some(end)) => format!(" merged:<{}", end.format(FORMAT)),
+            (None, None) => String::new(),
+        }
+    }
+
+    // Search qualifiers narrow the query; this exact check on the item's own
+    // merged_at decides membership.
+    fn admits(&self, item: &Value) -> Result<bool> {
+        if self.merged_since.is_none() && self.merged_before.is_none() {
+            return Ok(true);
+        }
+        let pull = item["pull_request"]
+            .as_object()
+            .ok_or("search item missing pull_request")?;
+        // Only an explicit null means unmerged; anything else unexpected fails
+        // rather than silently dropping a candidate.
+        let at = match pull.get("merged_at") {
+            Some(Value::Null) => return Ok(false),
+            Some(Value::String(at)) => at,
+            _ => return Err("search item missing or invalid merged_at".into()),
+        };
+        let at = at.parse::<DateTime<Utc>>().map_err(|e| e.to_string())?;
+        Ok(self.merged_since.is_none_or(|d| at >= midnight(d))
+            && self.merged_before.is_none_or(|d| at < midnight(d)))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct Candidate {
     repository: String,
@@ -192,28 +279,40 @@ fn discover(
     repos: &[&str],
     since: NaiveDate,
     exclusions: &BTreeSet<String>,
+    scope: &Scope,
 ) -> Result<Vec<Candidate>> {
+    scope.validate()?;
+    let (max_pages, page_size) = (scope.max_pages, scope.page_size);
     let mut candidates = BTreeMap::new();
     for repo in repos {
         repository(repo)?;
         // GitHub has no review-submission date qualifier. Updated bounds are a
         // superset; filter actual submitted reviews after fetching every page.
         let query = encoded(&format!(
-            "repo:{repo} is:pr reviewed-by:{login} -author:{login} updated:>={since}"
+            "repo:{repo} is:pr reviewed-by:{login} -author:{login} updated:>={since}{}",
+            scope.qualifiers()
         ));
         let mut seen = 0;
         let mut total = None;
-        for page in 1..=10 {
+        for page in 1..=max_pages {
             let value = get(
                 api,
-                &format!("search/issues?q={query}&sort=created&order=asc&per_page=100&page={page}"),
+                &format!(
+                    "search/issues?q={query}&sort=created&order=asc&per_page={page_size}&page={page}"
+                ),
             )?;
             let count = value["total_count"]
                 .as_u64()
                 .ok_or("search missing total_count")?;
-            if value["incomplete_results"] != false || count > 1000 {
+            if value["incomplete_results"] != false || count > SEARCH_CAP as u64 {
                 return Err(format!(
-                    "incomplete search or over 1,000 results for {repo}; narrow --since"
+                    "incomplete search or over 1,000 results for {repo}; narrow --since or the merged window"
+                ));
+            }
+            // Fail closed rather than return a list truncated at the bound.
+            if count > (max_pages * page_size) as u64 {
+                return Err(format!(
+                    "{count} results for {repo} exceed {max_pages} pages of {page_size}; narrow --since or the merged window"
                 ));
             }
             if total.replace(count).is_some_and(|old| old != count) {
@@ -227,7 +326,10 @@ fn discover(
                     .filter(|n| *n > 0)
                     .ok_or("invalid search PR number")?;
                 let id = format!("{}#{number}", repo.to_ascii_lowercase());
-                if exclusions.contains(&id) || candidates.contains_key(&id) {
+                if exclusions.contains(&id)
+                    || candidates.contains_key(&id)
+                    || !scope.admits(item)?
+                {
                     continue;
                 }
                 let reviews = pages(api, &format!("repos/{repo}/pulls/{number}/reviews"))?;
@@ -260,7 +362,7 @@ fn discover(
             if seen == count {
                 break;
             }
-            if items.len() < PAGE_SIZE || seen > count || page == 10 {
+            if items.len() < page_size || seen > count || page == max_pages {
                 return Err("truncated search results".into());
             }
         }
@@ -803,7 +905,17 @@ pub fn run(args: &[String]) -> Result<u8> {
         return Ok(0);
     }
     let allowed: &[&str] = match command {
-        "discover" => &["--login", "--repos", "--since", "--exclude", "--out"],
+        "discover" => &[
+            "--login",
+            "--repos",
+            "--since",
+            "--exclude",
+            "--out",
+            "--merged-since",
+            "--merged-before",
+            "--max-pages",
+            "--page-size",
+        ],
         "build" => &[
             "--pr",
             "--base",
@@ -838,8 +950,24 @@ pub fn run(args: &[String]) -> Result<u8> {
     }
     match command {
         "discover" => {
-            let since = NaiveDate::parse_from_str(required("--since")?, "%Y-%m-%d")
-                .map_err(|e| e.to_string())?;
+            let date =
+                |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| format!("{s}: {e}"));
+            let since = date(required("--since")?)?;
+            let defaults = Scope::default();
+            let count = |key, default: usize| {
+                options.get(key).map_or(Ok(default), |s| {
+                    s.parse::<usize>().map_err(|e| format!("{key}: {e}"))
+                })
+            };
+            let scope = Scope {
+                merged_since: options.get("--merged-since").map(|s| date(s)).transpose()?,
+                merged_before: options
+                    .get("--merged-before")
+                    .map(|s| date(s))
+                    .transpose()?,
+                max_pages: count("--max-pages", defaults.max_pages)?,
+                page_size: count("--page-size", defaults.page_size)?,
+            };
             let mut excluded = BTreeSet::new();
             if let Some(value) = options.get("--exclude") {
                 for id in value.split(',') {
@@ -849,7 +977,14 @@ pub fn run(args: &[String]) -> Result<u8> {
             }
             let repos: Vec<_> = required("--repos")?.split(',').collect();
             let out = required("--out")?;
-            let candidates = discover(&mut Gh, required("--login")?, &repos, since, &excluded)?;
+            let candidates = discover(
+                &mut Gh,
+                required("--login")?,
+                &repos,
+                since,
+                &excluded,
+                &scope,
+            )?;
             write_new(
                 Path::new(out),
                 &serde_json::to_vec_pretty(&candidates).map_err(|e| e.to_string())?,
@@ -928,7 +1063,48 @@ mod tests {
         fn get(&mut self, endpoint: &str, accept: &str) -> Result<Vec<u8>> {
             self.calls.push(endpoint.into());
             let value = if endpoint.starts_with("search/issues?") {
-                &self.data["search"]
+                // Serve the requested page so page bounds are exercised.
+                let param = |key: &str| -> usize {
+                    endpoint
+                        .split(['?', '&'])
+                        .find_map(|p| p.strip_prefix(key))
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                };
+                let (size, page) = (param("per_page="), param("page="));
+                let mut search = self.data["search"].clone();
+                let items = search["items"].as_array_mut().unwrap();
+                // Like GitHub, apply only a single inclusive merged range;
+                // repeated merged qualifiers are not intersected.
+                let range = endpoint
+                    .split_once(&encoded(" merged:"))
+                    .and_then(|(_, rest)| {
+                        let token = rest.split('&').next()?.split("%20").next()?;
+                        let token = token.replace("%3A", ":");
+                        let (start, last) = token.split_once("..")?;
+                        Some((
+                            start.parse::<DateTime<Utc>>().unwrap(),
+                            last.parse::<DateTime<Utc>>().unwrap(),
+                        ))
+                    });
+                if let Some((start, last)) = range {
+                    items.retain(|item| {
+                        item["pull_request"]["merged_at"]
+                            .as_str()
+                            .and_then(|at| at.parse::<DateTime<Utc>>().ok())
+                            .is_some_and(|at| (start..=last).contains(&at))
+                    });
+                    search["total_count"] = items.len().into();
+                }
+                let items = search["items"].as_array_mut().unwrap();
+                *items = items
+                    .iter()
+                    .skip((page - 1) * size)
+                    .take(size)
+                    .cloned()
+                    .collect();
+                return Ok(serde_json::to_vec(&search).unwrap());
             } else if endpoint.contains("/reviews?") {
                 &self.data["reviews"]
             } else if endpoint == "repos/o/r/pulls/1" {
@@ -994,6 +1170,7 @@ mod tests {
             &["o/r"],
             "2025-03-01".parse().unwrap(),
             &BTreeSet::from(["o/r#2".into()]),
+            &Scope::default(),
         )
         .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -1009,7 +1186,8 @@ mod tests {
                 "reviewer",
                 &["o/r"],
                 "2025-04-01".parse().unwrap(),
-                &BTreeSet::new()
+                &BTreeSet::new(),
+                &Scope::default()
             )
             .unwrap()
             .is_empty()
@@ -1027,10 +1205,126 @@ mod tests {
                     "reviewer",
                     &["o/r"],
                     "2025-01-01".parse().unwrap(),
-                    &BTreeSet::new()
+                    &BTreeSet::new(),
+                    &Scope::default()
                 )
                 .is_err()
             );
+        }
+    }
+
+    fn scoped(api: &mut FixtureApi, scope: Scope) -> Result<Vec<u64>> {
+        let found = discover(
+            api,
+            "reviewer",
+            &["o/r"],
+            "2025-01-01".parse().unwrap(),
+            &BTreeSet::new(),
+            &scope,
+        )?;
+        Ok(found.iter().map(|c| c.number).collect())
+    }
+
+    #[test]
+    fn discovery_merged_window_edges() {
+        let window = |since: Option<&str>, before: Option<&str>| Scope {
+            merged_since: since.map(|s| s.parse().unwrap()),
+            merged_before: before.map(|s| s.parse().unwrap()),
+            ..Scope::default()
+        };
+        // #1 merged at 2025-02-01T00:00:00Z; #2 is unmerged.
+        for (since, before, expected) in [
+            (None, None, vec![1, 2]),
+            (Some("2025-02-01"), None, vec![1]),
+            (Some("2025-02-02"), None, vec![]),
+            (None, Some("2025-02-01"), vec![]),
+            (None, Some("2025-02-02"), vec![1]),
+            (Some("2025-02-01"), Some("2025-02-02"), vec![1]),
+        ] {
+            let mut api = FixtureApi::new();
+            assert_eq!(
+                scoped(&mut api, window(since, before)).unwrap(),
+                expected,
+                "{since:?}..{before:?}"
+            );
+            if since.is_some() {
+                assert!(api.calls[0].contains(&encoded(" merged:")));
+                assert_eq!(api.calls[0].matches("merged").count(), 1);
+            }
+        }
+        let mut api = FixtureApi::new();
+        scoped(&mut api, window(Some("2025-02-02"), None)).unwrap();
+        assert!(
+            !api.calls.iter().any(|s| s.contains("/reviews")),
+            "out-of-window PRs are filtered before fetching reviews"
+        );
+        assert!(scoped(&mut api, window(Some("2025-02-01"), Some("2025-02-01"))).is_err());
+        let mut api = FixtureApi::new();
+        api.data["search"]["items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("pull_request");
+        assert!(scoped(&mut api, window(Some("2025-02-01"), None)).is_err());
+        for merged_at in [None, Some(Value::from(1))] {
+            let mut api = FixtureApi::new();
+            let pull = api.data["search"]["items"][1]["pull_request"]
+                .as_object_mut()
+                .unwrap();
+            pull.remove("merged_at");
+            if let Some(v) = merged_at {
+                pull.insert("merged_at".into(), v);
+            }
+            let error = scoped(&mut api, window(Some("2025-02-01"), None)).unwrap_err();
+            assert!(error.contains("merged_at"), "{error}");
+        }
+    }
+
+    #[test]
+    fn discovery_paired_window_is_one_range() {
+        let mut api = FixtureApi::new();
+        let items = api.data["search"]["items"].as_array_mut().unwrap();
+        // Out-of-window merges that overflow 5 pages of 20 unless the search
+        // intersects both bounds.
+        for number in 3..=150 {
+            items.push(serde_json::json!(
+                {"number": number, "pull_request": {"merged_at": "2022-06-01T00:00:00Z"}}
+            ));
+        }
+        api.data["search"]["total_count"] = items.len().into();
+        let scope = Scope {
+            merged_since: Some("2025-02-01".parse().unwrap()),
+            merged_before: Some("2025-02-02".parse().unwrap()),
+            max_pages: 5,
+            page_size: 20,
+        };
+        assert_eq!(scoped(&mut api, scope).unwrap(), vec![1]);
+        assert!(api.calls[0].contains(&encoded(
+            " merged:2025-02-01T00:00:00Z..2025-02-01T23:59:59Z"
+        )));
+    }
+
+    #[test]
+    fn discovery_page_bound_fails_closed() {
+        let bound = |max_pages, page_size| Scope {
+            max_pages,
+            page_size,
+            ..Scope::default()
+        };
+        let mut api = FixtureApi::new();
+        assert_eq!(scoped(&mut api, bound(2, 1)).unwrap(), vec![1, 2]);
+        assert_eq!(
+            api.calls
+                .iter()
+                .filter(|s| s.starts_with("search/"))
+                .count(),
+            2
+        );
+        let mut api = FixtureApi::new();
+        let error = scoped(&mut api, bound(1, 1)).unwrap_err();
+        assert!(error.contains("exceed 1 pages of 1"), "{error}");
+        assert_eq!(api.calls.len(), 1, "no reviews read past the bound");
+        for (max_pages, page_size) in [(0, 20), (5, 0), (5, 101), (11, 100), (51, 20)] {
+            assert!(scoped(&mut FixtureApi::new(), bound(max_pages, page_size)).is_err());
         }
     }
 
